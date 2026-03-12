@@ -15,10 +15,12 @@ const PORT = process.env.PORT || 3000;
 const CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET;
 const CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
 const FAQ_PATH = path.join(__dirname, "data", "faq.json");
+const CATALOG_PATH = path.join(__dirname, "data", "catalog.txt");
 const TICKETS_PATH = path.join(__dirname, "tickets.jsonl");
 const AUTO_REPLY_THRESHOLD = 0.75;
 
 let FAQS = [];
+let CATALOG_LINES = [];
 
 function loadFaqs() {
   try {
@@ -28,6 +30,20 @@ function loadFaqs() {
   } catch (err) {
     console.error("Failed to load FAQ:", err.message);
     FAQS = [];
+  }
+}
+
+function loadCatalog() {
+  try {
+    const raw = fs.readFileSync(CATALOG_PATH, "utf8");
+    CATALOG_LINES = raw
+      .split(/\r?\n/)
+      .map((x) => x.trim())
+      .filter(Boolean);
+    console.log(`Loaded catalog lines: ${CATALOG_LINES.length}`);
+  } catch (err) {
+    console.error("Failed to load catalog:", err.message);
+    CATALOG_LINES = [];
   }
 }
 
@@ -76,6 +92,39 @@ function findBestAnswer(userText) {
   };
 }
 
+function tokenize(text = "") {
+  return normalizeText(text)
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .split(/\s+/)
+    .filter((t) => t.length >= 2);
+}
+
+function retrieveCatalogAnswer(userText) {
+  const qTokens = tokenize(userText);
+  if (!qTokens.length || !CATALOG_LINES.length) {
+    return { answer: null, confidence: 0 };
+  }
+
+  const scored = CATALOG_LINES.map((line) => {
+    const lineNorm = normalizeText(line);
+    let hit = 0;
+    for (const t of qTokens) {
+      if (lineNorm.includes(t)) hit += 1;
+    }
+    const score = hit / Math.max(2, qTokens.length);
+    return { line, score };
+  })
+    .filter((x) => x.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 3);
+
+  if (!scored.length) return { answer: null, confidence: 0 };
+
+  const confidence = Number(Math.min(1, scored[0].score).toFixed(2));
+  const answer = scored.map((x) => `- ${x.line}`).join("\n");
+  return { answer, confidence };
+}
+
 function createTicket({ userId, question, confidence }) {
   const ticket = {
     ticket_id: `T${Date.now()}`,
@@ -108,7 +157,7 @@ async function replyToLine(replyToken, text) {
 }
 
 app.get("/", (_, res) => res.send("LINE OA bot is running"));
-app.get("/health", (_, res) => res.json({ ok: true, faqCount: FAQS.length }));
+app.get("/health", (_, res) => res.json({ ok: true, faqCount: FAQS.length, catalogLineCount: CATALOG_LINES.length }));
 
 app.post("/webhook/line", async (req, res) => {
   try {
@@ -130,13 +179,22 @@ app.post("/webhook/line", async (req, res) => {
       const replyToken = event.replyToken;
       const userId = event.source?.userId || "unknown";
 
-      const { best, confidence } = findBestAnswer(userText);
+      const { best, confidence: faqConfidence } = findBestAnswer(userText);
+      const { answer: catalogAnswer, confidence: catalogConfidence } = retrieveCatalogAnswer(userText);
 
-      if (best && confidence >= AUTO_REPLY_THRESHOLD) {
-        const message = `${best.answer}\n\n(ความมั่นใจ: ${confidence})`;
+      const useFaq = best && faqConfidence >= AUTO_REPLY_THRESHOLD;
+      const useCatalog = !useFaq && catalogAnswer && catalogConfidence >= 0.5;
+
+      if (useFaq) {
+        const message = `${best.answer}\n\n(ความมั่นใจ: ${faqConfidence})`;
         await replyToLine(replyToken, message);
-        console.log(`AUTO_REPLY user=${userId} confidence=${confidence} faq=${best.id}`);
+        console.log(`AUTO_REPLY_FAQ user=${userId} confidence=${faqConfidence} faq=${best.id}`);
+      } else if (useCatalog) {
+        const message = `อ้างอิงจากข้อมูลในไฟล์:\n${catalogAnswer}\n\n(ความมั่นใจ: ${catalogConfidence})`;
+        await replyToLine(replyToken, message);
+        console.log(`AUTO_REPLY_CATALOG user=${userId} confidence=${catalogConfidence}`);
       } else {
+        const confidence = Math.max(faqConfidence || 0, catalogConfidence || 0);
         const ticket = createTicket({ userId, question: userText, confidence });
         const message = `ขอบคุณสำหรับคำถามครับ ตอนนี้กำลังส่งต่อเจ้าหน้าที่ดูแลให้เรียบร้อยแล้ว\nเลขที่คำขอ: ${ticket.ticket_id}`;
         await replyToLine(replyToken, message);
@@ -152,6 +210,7 @@ app.post("/webhook/line", async (req, res) => {
 });
 
 loadFaqs();
+loadCatalog();
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
