@@ -23,6 +23,7 @@ const AUTO_REPLY_THRESHOLD = 0.75;
 
 let FAQS = [];
 let CATALOG_LINES = [];
+let CATALOG_RAW = "";
 
 function loadFaqs() {
   try {
@@ -38,6 +39,7 @@ function loadFaqs() {
 function loadCatalog() {
   try {
     const raw = fs.readFileSync(CATALOG_PATH, "utf8");
+    CATALOG_RAW = raw;
     CATALOG_LINES = raw
       .split(/\r?\n/)
       .map((x) => x.trim())
@@ -46,6 +48,7 @@ function loadCatalog() {
   } catch (err) {
     console.error("Failed to load catalog:", err.message);
     CATALOG_LINES = [];
+    CATALOG_RAW = "";
   }
 }
 
@@ -164,11 +167,12 @@ async function generateWithOpenRouter(userText, contextText) {
   const payload = {
     model: OPENROUTER_MODEL,
     temperature: 0.2,
+    response_format: { type: "json_object" },
     messages: [
       {
         role: "system",
         content:
-          "คุณคือผู้ช่วยตอบลูกค้าเกี่ยวกับคอร์สฝึกอบรม ให้ตอบสั้น กระชับ สุภาพ และยึดเฉพาะข้อมูลที่ให้มาเท่านั้น ถ้าข้อมูลไม่พอให้ตอบว่า 'ขอส่งต่อเจ้าหน้าที่เพื่อตรวจสอบข้อมูลเพิ่มเติม'",
+          "คุณคือผู้ช่วยตอบลูกค้าเกี่ยวกับคอร์สฝึกอบรมจากข้อมูลอ้างอิงเท่านั้น ห้ามเดา หากข้อมูลไม่พอให้ส่ง found=false ตอบเป็น JSON เท่านั้น: {\"found\":boolean,\"answer\":string}",
       },
       {
         role: "user",
@@ -187,7 +191,18 @@ async function generateWithOpenRouter(userText, contextText) {
     timeout: 30000,
   });
 
-  return response.data?.choices?.[0]?.message?.content?.trim() || null;
+  const raw = response.data?.choices?.[0]?.message?.content?.trim();
+  if (!raw) return null;
+
+  try {
+    const parsed = JSON.parse(raw);
+    return {
+      found: !!parsed.found,
+      answer: String(parsed.answer || "").trim(),
+    };
+  } catch {
+    return null;
+  }
 }
 
 app.get("/", (_, res) => res.send("LINE OA bot is running"));
@@ -218,32 +233,36 @@ app.post("/webhook/line", async (req, res) => {
 
       const useFaq = best && faqConfidence >= AUTO_REPLY_THRESHOLD;
       const useCatalog = !useFaq && catalogAnswer && catalogConfidence >= 0.5;
+      const baseConfidence = Math.max(faqConfidence || 0, catalogConfidence || 0);
 
-      if (useFaq || useCatalog) {
-        const confidence = Math.max(faqConfidence || 0, catalogConfidence || 0);
-        const contextParts = [];
-        if (best?.answer) contextParts.push(`FAQ: ${best.answer}`);
-        if (catalogAnswer) contextParts.push(`CATALOG:\n${catalogAnswer}`);
+      // ลองให้ OpenRouter อ่านบริบทจากไฟล์เต็มก่อน
+      if (OPENROUTER_API_KEY) {
+        try {
+          const contextParts = [];
+          if (best?.answer) contextParts.push(`FAQ ที่ตรง:\n${best.answer}`);
+          if (catalogAnswer) contextParts.push(`ประโยคที่ค้นเจอ:\n${catalogAnswer}`);
+          if (CATALOG_RAW) contextParts.push(`ไฟล์ข้อมูลทั้งหมด:\n${CATALOG_RAW.slice(0, 12000)}`);
 
-        let finalMessage = best?.answer || catalogAnswer;
-
-        if (OPENROUTER_API_KEY) {
-          try {
-            const aiMessage = await generateWithOpenRouter(userText, contextParts.join("\n\n"));
-            if (aiMessage) finalMessage = aiMessage;
-            console.log(`AUTO_REPLY_OPENROUTER user=${userId} confidence=${confidence} model=${OPENROUTER_MODEL}`);
-          } catch (err) {
-            console.error("OpenRouter error:", err.response?.data || err.message);
+          const aiResult = await generateWithOpenRouter(userText, contextParts.join("\n\n"));
+          if (aiResult?.found && aiResult?.answer) {
+            await replyToLine(replyToken, aiResult.answer);
+            console.log(`AUTO_REPLY_OPENROUTER user=${userId} confidence=${baseConfidence} model=${OPENROUTER_MODEL}`);
+            continue;
           }
+        } catch (err) {
+          console.error("OpenRouter error:", err.response?.data || err.message);
         }
+      }
 
-        await replyToLine(replyToken, `${finalMessage}\n\n(ความมั่นใจ: ${confidence})`);
+      // fallback: rule-based
+      if (useFaq || useCatalog) {
+        const finalMessage = best?.answer || catalogAnswer;
+        await replyToLine(replyToken, `${finalMessage}\n\n(ความมั่นใจ: ${baseConfidence})`);
       } else {
-        const confidence = Math.max(faqConfidence || 0, catalogConfidence || 0);
-        const ticket = createTicket({ userId, question: userText, confidence });
+        const ticket = createTicket({ userId, question: userText, confidence: baseConfidence });
         const message = `ขอบคุณสำหรับคำถามครับ ตอนนี้กำลังส่งต่อเจ้าหน้าที่ดูแลให้เรียบร้อยแล้ว\nเลขที่คำขอ: ${ticket.ticket_id}`;
         await replyToLine(replyToken, message);
-        console.log(`TICKET_CREATED user=${userId} ticket=${ticket.ticket_id} confidence=${confidence}`);
+        console.log(`TICKET_CREATED user=${userId} ticket=${ticket.ticket_id} confidence=${baseConfidence}`);
       }
     }
 
