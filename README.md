@@ -16,6 +16,11 @@ npm start
 - `GET /health`
 - `POST /webhook/line`
 
+## Behavior (MVP RAG-lite)
+- อ่านฐานความรู้จาก `data/faq.json`
+- ถ้าความมั่นใจ >= 0.75 จะตอบอัตโนมัติ
+- ถ้าความมั่นใจ < 0.75 จะสร้าง ticket ลง `tickets.jsonl` และแจ้งลูกค้าว่าส่งต่อเจ้าหน้าที่แล้ว
+
 ## Deploy (Render)
 - Runtime: Node
 - Build command: `npm install`
