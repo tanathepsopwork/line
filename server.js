@@ -14,6 +14,8 @@ function rawBodySaver(req, res, buf) {
 const PORT = process.env.PORT || 3000;
 const CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET;
 const CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
+const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || "openai/gpt-4o-mini";
 const FAQ_PATH = path.join(__dirname, "data", "faq.json");
 const CATALOG_PATH = path.join(__dirname, "data", "catalog.txt");
 const TICKETS_PATH = path.join(__dirname, "tickets.jsonl");
@@ -156,8 +158,40 @@ async function replyToLine(replyToken, text) {
   );
 }
 
+async function generateWithOpenRouter(userText, contextText) {
+  if (!OPENROUTER_API_KEY) return null;
+
+  const payload = {
+    model: OPENROUTER_MODEL,
+    temperature: 0.2,
+    messages: [
+      {
+        role: "system",
+        content:
+          "คุณคือผู้ช่วยตอบลูกค้าเกี่ยวกับคอร์สฝึกอบรม ให้ตอบสั้น กระชับ สุภาพ และยึดเฉพาะข้อมูลที่ให้มาเท่านั้น ถ้าข้อมูลไม่พอให้ตอบว่า 'ขอส่งต่อเจ้าหน้าที่เพื่อตรวจสอบข้อมูลเพิ่มเติม'",
+      },
+      {
+        role: "user",
+        content: `คำถามลูกค้า: ${userText}\n\nข้อมูลอ้างอิง:\n${contextText}`,
+      },
+    ],
+  };
+
+  const response = await axios.post("https://openrouter.ai/api/v1/chat/completions", payload, {
+    headers: {
+      Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+      "Content-Type": "application/json",
+      "HTTP-Referer": "https://github.com/tanathepsopwork/line",
+      "X-Title": "line-oa-support-bot",
+    },
+    timeout: 30000,
+  });
+
+  return response.data?.choices?.[0]?.message?.content?.trim() || null;
+}
+
 app.get("/", (_, res) => res.send("LINE OA bot is running"));
-app.get("/health", (_, res) => res.json({ ok: true, faqCount: FAQS.length, catalogLineCount: CATALOG_LINES.length }));
+app.get("/health", (_, res) => res.json({ ok: true, faqCount: FAQS.length, catalogLineCount: CATALOG_LINES.length, openrouter: !!OPENROUTER_API_KEY, model: OPENROUTER_MODEL }));
 
 app.post("/webhook/line", async (req, res) => {
   try {
@@ -185,14 +219,25 @@ app.post("/webhook/line", async (req, res) => {
       const useFaq = best && faqConfidence >= AUTO_REPLY_THRESHOLD;
       const useCatalog = !useFaq && catalogAnswer && catalogConfidence >= 0.5;
 
-      if (useFaq) {
-        const message = `${best.answer}\n\n(ความมั่นใจ: ${faqConfidence})`;
-        await replyToLine(replyToken, message);
-        console.log(`AUTO_REPLY_FAQ user=${userId} confidence=${faqConfidence} faq=${best.id}`);
-      } else if (useCatalog) {
-        const message = `อ้างอิงจากข้อมูลในไฟล์:\n${catalogAnswer}\n\n(ความมั่นใจ: ${catalogConfidence})`;
-        await replyToLine(replyToken, message);
-        console.log(`AUTO_REPLY_CATALOG user=${userId} confidence=${catalogConfidence}`);
+      if (useFaq || useCatalog) {
+        const confidence = Math.max(faqConfidence || 0, catalogConfidence || 0);
+        const contextParts = [];
+        if (best?.answer) contextParts.push(`FAQ: ${best.answer}`);
+        if (catalogAnswer) contextParts.push(`CATALOG:\n${catalogAnswer}`);
+
+        let finalMessage = best?.answer || catalogAnswer;
+
+        if (OPENROUTER_API_KEY) {
+          try {
+            const aiMessage = await generateWithOpenRouter(userText, contextParts.join("\n\n"));
+            if (aiMessage) finalMessage = aiMessage;
+            console.log(`AUTO_REPLY_OPENROUTER user=${userId} confidence=${confidence} model=${OPENROUTER_MODEL}`);
+          } catch (err) {
+            console.error("OpenRouter error:", err.response?.data || err.message);
+          }
+        }
+
+        await replyToLine(replyToken, `${finalMessage}\n\n(ความมั่นใจ: ${confidence})`);
       } else {
         const confidence = Math.max(faqConfidence || 0, catalogConfidence || 0);
         const ticket = createTicket({ userId, question: userText, confidence });

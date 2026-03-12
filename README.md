@@ -16,10 +16,11 @@ npm start
 - `GET /health`
 - `POST /webhook/line`
 
-## Behavior (MVP RAG-lite)
-- อ่านฐานความรู้จาก `data/faq.json`
-- ถ้าความมั่นใจ >= 0.75 จะตอบอัตโนมัติ
-- ถ้าความมั่นใจ < 0.75 จะสร้าง ticket ลง `tickets.jsonl` และแจ้งลูกค้าว่าส่งต่อเจ้าหน้าที่แล้ว
+## Behavior (MVP RAG-lite + OpenRouter)
+- อ่านฐานความรู้จาก `data/faq.json` และ `data/catalog.txt`
+- ถ้าเจอข้อมูลที่เกี่ยวข้อง จะตอบอัตโนมัติ
+- ถ้าตั้งค่า `OPENROUTER_API_KEY` ระบบจะใช้ OpenRouter เรียบเรียงคำตอบจากบริบท
+- ถ้าไม่มั่นใจ จะสร้าง ticket ลง `tickets.jsonl` และแจ้งลูกค้าว่าส่งต่อเจ้าหน้าที่แล้ว
 
 ## Deploy (Render)
 - Runtime: Node
